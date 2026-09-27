@@ -201,6 +201,45 @@ def test_incomplete_matrix_fails_closed(tmp_path: Path) -> None:
         run_execution(config, harness=ScriptedHarness())
 
 
+def test_load_execution_config_single_model_no_large_tier(tmp_path: Path) -> None:
+    """spec 017: a one-model option_a config must not require a large tier."""
+    option_a = tmp_path / "option_a_one_model.yaml"
+    option_a.write_text(
+        "models:\n  - slug: openai/gpt-5-mini\n    tier: small\n",
+        encoding="utf-8",
+    )
+    generations = tmp_path / "generations.jsonl"
+    _write_generations(generations, [_record(model_slug="openai/gpt-5-mini")])
+    execution_config = tmp_path / "execution_one_model.yaml"
+    execution_config.write_text(
+        f"option_a_config: {option_a}\ninput_generations: {generations}\n",
+        encoding="utf-8",
+    )
+
+    config = load_execution_config(
+        config_path=execution_config,
+        output_dir=tmp_path / "exec",
+        run_id="single-model",
+    )
+
+    assert config.model_slugs == ("openai/gpt-5-mini",)
+    assert config.m1_slug == "openai/gpt-5-mini"
+    assert config.m2_slug == "openai/gpt-5-mini"
+
+
+def test_load_execution_config_two_model_still_requires_large_tier(
+    tmp_path: Path,
+) -> None:
+    """Existing two-model configs (e.g. configs/option_a.yaml) are unaffected."""
+    config = load_execution_config(
+        output_dir=tmp_path / "exec",
+        run_id="two-model",
+    )
+    assert config.m1_slug != config.m2_slug
+    assert config.m1_slug == QWEN_7B
+    assert config.m2_slug == QWEN_72B
+
+
 def test_resume_skips_finished_pairs(tmp_path: Path) -> None:
     generations = tmp_path / "generations.jsonl"
     small = _record()

@@ -1,0 +1,22 @@
+# Stage-2 execution (SWE-bench Verified harness) for the sanity-check run
+# (spec 017). Parallel to configs/execution.yaml (Lite, two-model); this one
+# is Verified, single-model, and points at its own run directory so it never
+# collides with the Lite sweep's output.
+
+input_generations: data/outputs/runs/verified-sanity-gpt5mini/generations.jsonl
+option_a_config: configs/option_a_verified.yaml
+
+# Confirmed against Hugging Face directly (SWE-bench/SWE-bench_Verified
+# exists), matching the existing SWE-bench/SWE-bench_Lite convention already
+# used by configs/execution.yaml.
+dataset_name: SWE-bench/SWE-bench_Verified
+split: test
+
+max_workers: 4
+timeout: 1800
+namespace: swebench
+cache_level: env
+force_rebuild: false
+modal: false
+
+m1_positive_rate_flag_threshold: 0.15

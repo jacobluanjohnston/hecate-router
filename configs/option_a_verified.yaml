@@ -1,0 +1,13 @@
+# Single-model config for the SWE-bench Verified sanity-check run (spec 017).
+# Shape matches configs/option_a.yaml (consumed by
+# hecate.execution.runner.load_execution_config) but with one model instead
+# of a small/large pair -- see specs/017-swebench-verified-sanity-check/plan.md
+# for the runner.py fix that makes a single-model config load without a
+# large-tier slug present.
+
+provider: openrouter
+base_url: https://openrouter.ai/api/v1
+
+models:
+  - slug: openai/gpt-5-mini
+    tier: small

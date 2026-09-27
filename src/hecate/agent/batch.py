@@ -51,6 +51,7 @@ def build_swebench_batch_argv(
     filter_spec: str | None = None,
     redo_existing: bool = False,
     environment_class: str | None = None,
+    model_class: str | None = None,
     config_overrides: tuple[str, ...] | list[str] = (),
     mini_extra: str = "mini-extra",
 ) -> list[str]:
@@ -60,6 +61,9 @@ def build_swebench_batch_argv(
     drops its default config file as soon as any ``-c`` is given, so the caller
     must include the benchmark config itself (e.g. ``swebench.yaml``) whenever
     it overrides a key such as ``agent.cost_limit``.
+
+    ``model_class`` selects mini-SWE-agent's model wrapper (e.g. ``"litellm"``,
+    ``"openrouter"``); omitted, upstream defaults to ``LitellmModel``.
     """
     argv: list[str] = [
         mini_extra,
@@ -83,6 +87,8 @@ def build_swebench_batch_argv(
         argv.append("--redo-existing")
     if environment_class is not None:
         argv.extend(["--environment-class", environment_class])
+    if model_class is not None:
+        argv.extend(["--model-class", model_class])
     for override in config_overrides:
         argv.extend(["-c", override])
     return argv
@@ -99,6 +105,7 @@ def run_swebench_batch(
     filter_spec: str | None = None,
     redo_existing: bool = False,
     environment_class: str | None = None,
+    model_class: str | None = None,
     config_overrides: tuple[str, ...] | list[str] = (),
     global_cost_limit: float | None = None,
     dry_run: bool = False,
@@ -122,6 +129,7 @@ def run_swebench_batch(
         filter_spec=filter_spec,
         redo_existing=redo_existing,
         environment_class=environment_class,
+        model_class=model_class,
         config_overrides=config_overrides,
         mini_extra=exe,
     )

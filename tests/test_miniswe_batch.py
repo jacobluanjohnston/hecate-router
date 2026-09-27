@@ -107,6 +107,19 @@ def test_batch_argv_slice_and_overrides() -> None:
     assert "agent.cost_limit=0.25" in argv
 
 
+def test_batch_argv_model_class_passthrough() -> None:
+    """spec 017: an explicit --model-class must be forwarded to mini-extra."""
+    argv = build_swebench_batch_argv(
+        model="m", output_dir="/tmp/out", model_class="openrouter"
+    )
+    assert _arg(argv, "--model-class") == "openrouter"
+
+
+def test_batch_argv_model_class_omitted_by_default() -> None:
+    argv = build_swebench_batch_argv(model="m", output_dir="/tmp/out")
+    assert "--model-class" not in argv
+
+
 def test_run_batch_dry_run_does_not_shell_out(tmp_path: Path) -> None:
     with patch("hecate.agent.batch.require_miniswe"), patch(
         "hecate.agent.batch.subprocess.run"

@@ -246,7 +246,11 @@ def load_execution_config(
         force_rebuild=bool(data.get("force_rebuild") or False),
         modal=bool(data.get("modal") or False),
         m1_slug=_slug_for_tier(option_a, "small"),
-        m2_slug=_slug_for_tier(option_a, "large"),
+        m2_slug=(
+            _slug_for_tier(option_a, "large")
+            if len(_ordered_slugs(option_a)) > 1
+            else _slug_for_tier(option_a, "small")
+        ),
         positive_rate_threshold=float(
             data.get("m1_positive_rate_flag_threshold") or 0.15
         ),
