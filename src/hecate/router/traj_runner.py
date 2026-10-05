@@ -23,23 +23,37 @@ from hecate.data.external_miniswe import (
 )
 from hecate.router.backends import ScriptedBackend
 from hecate.router.dataset import WhitespaceTokenizer
+from hecate.router.holdout import holdout_scores_path, write_holdout_scores
 from hecate.router.metrics import text_route_metrics
 from hecate.router.splits import (
     FoldAssignment,
     assign_grouped_repo_folds,
     assign_leave_repo_out,
+    assign_specialist_split,
     repo_histogram,
 )
 from hecate.router.traj import (
+    EARLY_STOP_METRIC,
+    EARLY_STOP_MIN_DELTA,
+    EARLY_STOP_PATIENCE,
+    FIT_VAL_N,
+    GRAD_CLIP_NORM,
     K_EVAL,
     K_MAX,
+    TRAJ_ARMS,
     TrajError,
     TrajExample,
     build_traj_examples,
     eval_examples,
+    parse_arm,
     parse_traj_dir,
     second_holdout_repo,
     truncation_report,
+)
+from hecate.utils.artifacts import (
+    finalize_run_artifacts,
+    resolve_artifacts_uri,
+    run_dest_uri,
 )
 from hecate.utils.manifest import git_commit_sha, write_run_manifest
 
@@ -50,9 +64,12 @@ def _repo_root() -> Path:
 
 _SPLIT_GROUPED = "grouped"
 _SPLIT_LEAVE_REPO = "leave-repo"
+_SPLIT_SPECIALIST = "specialist"
 _DJANGO_REPO = "django/django"
 _DJANGO_HOLD_N = 231
 _DJANGO_REST_N = 269
+_DJANGO_SPECIALIST_TRAIN_N = 185
+_DJANGO_SPECIALIST_HOLD_N = 46
 _METRIC_KEYS = (
     "route_auc",
     "lift_vs_large_auc",
@@ -65,7 +82,7 @@ _METRIC_KEYS = (
     "oracle",
     "headroom",
 )
-ARMS = ("k0", "k3")
+ARMS = tuple(TRAJ_ARMS)
 PAPER_DEVIATION = (
     "No 3-way LLM paraphrases of q (SWE-Router §A.2); skipped for cost."
 )
@@ -90,6 +107,12 @@ class TrajTrainConfig:
     lora_alpha: int
     lora_dropout: float
     qlora: bool
+    val_size: int
+    grad_clip_norm: float
+    early_stopping: bool
+    early_stopping_metric: str
+    early_stopping_patience: int
+    early_stopping_min_delta: float
     arm: str
     k_eval: int
     k_max: int
@@ -97,6 +120,7 @@ class TrajTrainConfig:
     hold_repo: str
     provenance: str
     hold_only: bool
+    allow_unsynced: bool
     cli_overrides: dict[str, Any]
 
 
@@ -111,6 +135,7 @@ class TrajTrainResult:
     split_strategy: str
     truncation_rate: float
     arm: str
+    artifacts_uri: str | None
 
 
 def _load_yaml(path: Path) -> dict[str, Any]:
@@ -134,6 +159,7 @@ def load_traj_train_config(
     provenance: str = "unknown",
     seeds: tuple[int, ...] | None = None,
     hold_only: bool = False,
+    allow_unsynced: bool = False,
 ) -> TrajTrainConfig:
     root = _repo_root()
     resolved = (
@@ -162,14 +188,15 @@ def load_traj_train_config(
         traj = root / traj
     seeds_raw = list(seeds) if seeds is not None else (data.get("seeds") or [0, 1, 2])
     split_strategy = (split or _SPLIT_GROUPED).strip()
-    if split_strategy not in {_SPLIT_GROUPED, _SPLIT_LEAVE_REPO}:
+    if split_strategy not in {_SPLIT_GROUPED, _SPLIT_LEAVE_REPO, _SPLIT_SPECIALIST}:
         raise ValueError(
-            f"unknown split {split_strategy!r}; expected {_SPLIT_GROUPED} or {_SPLIT_LEAVE_REPO}"
+            f"unknown split {split_strategy!r}; expected "
+            f"{_SPLIT_GROUPED}, {_SPLIT_LEAVE_REPO}, or {_SPLIT_SPECIALIST}"
         )
     held = (hold_repo or _DJANGO_REPO).strip()
-    kind = (arm or "k3").strip().lower()
-    if kind not in ARMS:
-        raise ValueError(f"unknown arm {kind!r}; expected {ARMS}")
+    if split_strategy in {_SPLIT_LEAVE_REPO, _SPLIT_SPECIALIST} and not held:
+        raise ValueError("--hold-repo must be set for leave-repo and specialist splits")
+    kind, _spec = parse_arm(arm or "k3")
     return TrajTrainConfig(
         config_path=resolved,
         csv_path=csv,
@@ -188,6 +215,22 @@ def load_traj_train_config(
         lora_alpha=int(data.get("lora_alpha") or 64),
         lora_dropout=float(data.get("lora_dropout") or 0.05),
         qlora=bool(data.get("qlora", True)),
+        val_size=int(data.get("val_size") if data.get("val_size") is not None else FIT_VAL_N),
+        grad_clip_norm=float(
+            data.get("grad_clip_norm") if data.get("grad_clip_norm") is not None else GRAD_CLIP_NORM
+        ),
+        early_stopping=bool(data.get("early_stopping", False)),
+        early_stopping_metric=str(data.get("early_stopping_metric") or EARLY_STOP_METRIC),
+        early_stopping_patience=int(
+            data.get("early_stopping_patience")
+            if data.get("early_stopping_patience") is not None
+            else EARLY_STOP_PATIENCE
+        ),
+        early_stopping_min_delta=float(
+            data.get("early_stopping_min_delta")
+            if data.get("early_stopping_min_delta") is not None
+            else EARLY_STOP_MIN_DELTA
+        ),
         arm=kind,
         k_eval=int(data.get("k_eval") or K_EVAL),
         k_max=int(data.get("k_max") or K_MAX),
@@ -195,6 +238,7 @@ def load_traj_train_config(
         hold_repo=held,
         provenance=str(provenance or data.get("provenance") or "unknown"),
         hold_only=bool(hold_only),
+        allow_unsynced=bool(allow_unsynced),
         cli_overrides={
             "csv_path": str(csv),
             "traj_dir": str(traj),
@@ -206,6 +250,7 @@ def load_traj_train_config(
             "provenance": str(provenance or "unknown"),
             "seeds": [int(s) for s in seeds_raw],
             "hold_only": bool(hold_only),
+            "allow_unsynced": bool(allow_unsynced),
         },
     )
 
@@ -272,7 +317,25 @@ def _fmt_mean_std(stat: dict[str, Any] | None) -> str:
 
 
 def _eval_k(config: TrajTrainConfig) -> int:
-    return 0 if config.arm == "k0" else config.k_eval
+    _kind, spec = parse_arm(config.arm)
+    if spec.eval_k is None:
+        return config.k_eval
+    return spec.eval_k
+
+
+def lora_checkpoint_dir(output_dir: Path, *, arm: str, seed: int, fold: int) -> Path:
+    return Path(output_dir) / "checkpoints" / f"{arm}-seed{seed}-fold{fold}"
+
+
+def require_lora_checkpoint(path: Path) -> Path:
+    target = Path(path)
+    adapter = target / "adapter"
+    score = target / "score.pt"
+    if not score.is_file():
+        raise RuntimeError(f"missing LoRA score head at {score}")
+    if not adapter.is_dir() or not any(adapter.iterdir()):
+        raise RuntimeError(f"missing LoRA adapter at {adapter}")
+    return target
 
 
 def _score_hold(
@@ -281,34 +344,80 @@ def _score_hold(
     *,
     config: TrajTrainConfig,
     seed: int,
+    fold: int,
     scripted: ScriptedBackend | None,
 ) -> dict[str, Any]:
     k = _eval_k(config)
     hold_router = eval_examples(hold, k=k)
+    checkpoint: str | None = None
+    n_train_fit = len(train)
+    n_val_fit = 0
     if scripted is not None:
         scores = scripted.predict_proba(
             [ex.text for ex in hold_router],
             instance_ids=[ex.instance_id for ex in hold_router],
         )
-        return dict(text_route_metrics(hold_router, scores))
-    from hecate.router.traj_lora import TrajLoraBackend
+    else:
+        from hecate.router.traj_lora import TrajLoraBackend
 
-    backend = TrajLoraBackend(
-        config.backbone,
-        max_tokens=config.max_tokens,
-        epochs=config.epochs,
-        batch_size=config.batch_size,
-        grad_accum=config.grad_accum,
-        learning_rate=config.learning_rate,
-        lora_r=config.lora_r,
-        lora_alpha=config.lora_alpha,
-        lora_dropout=config.lora_dropout,
-        qlora=config.qlora,
-        log_dir=config.output_dir,
+        backend = TrajLoraBackend(
+            config.backbone,
+            max_tokens=config.max_tokens,
+            epochs=config.epochs,
+            batch_size=config.batch_size,
+            grad_accum=config.grad_accum,
+            learning_rate=config.learning_rate,
+            lora_r=config.lora_r,
+            lora_alpha=config.lora_alpha,
+            lora_dropout=config.lora_dropout,
+            qlora=config.qlora,
+            log_dir=config.output_dir,
+            val_size=config.val_size,
+            grad_clip_norm=config.grad_clip_norm,
+            early_stopping=config.early_stopping,
+            early_stopping_metric=config.early_stopping_metric,
+            early_stopping_patience=config.early_stopping_patience,
+            early_stopping_min_delta=config.early_stopping_min_delta,
+        )
+        backend.fit(train, arm=config.arm, seed=seed, k_max=config.k_max)
+        ckpt = lora_checkpoint_dir(
+            config.output_dir, arm=config.arm, seed=seed, fold=fold
+        )
+        backend.save(ckpt)
+        require_lora_checkpoint(ckpt)
+        checkpoint = str(ckpt)
+        scores = backend.predict_proba([ex.text for ex in hold_router])
+        n_train_fit = backend.n_train
+        n_val_fit = backend.n_val
+    scores_path = write_holdout_scores(
+        holdout_scores_path(config.output_dir),
+        examples=hold_router,
+        scores=scores,
+        seed=seed,
+        fold=fold,
+        arm=config.arm,
+        k_eval=k,
     )
-    backend.fit(train, arm=config.arm, seed=seed, k_max=config.k_max)
-    scores = backend.predict_proba([ex.text for ex in hold_router])
-    return dict(text_route_metrics(hold_router, scores))
+    payload = dict(text_route_metrics(hold_router, scores))
+    payload["checkpoint"] = checkpoint
+    payload["scores_path"] = str(scores_path)
+    payload["n_train"] = n_train_fit
+    payload["n_val"] = n_val_fit
+    payload["n_split_train"] = len(train)
+    informative = [
+        (ex, score)
+        for ex, score in zip(hold_router, scores, strict=True)
+        if ex.m1_resolves or ex.m2_resolves
+    ]
+    if informative:
+        inf_ex, inf_scores = zip(*informative, strict=True)
+        payload["informative_subset"] = {
+            "n": len(inf_ex),
+            **text_route_metrics(list(inf_ex), list(inf_scores)),
+        }
+    else:
+        payload["informative_subset"] = {"n": 0}
+    return payload
 
 
 def _cv_rows(
@@ -323,7 +432,7 @@ def _cv_rows(
     rows: list[dict[str, Any]] = []
     k = _eval_k(config)
     for fold in range(assignment.n_folds):
-        if config.hold_only and fold != 0:
+        if (config.hold_only or assignment.strategy == "specialist") and fold != 0:
             continue
         train, hold = _fold_traj(examples, assignment, fold)
         if not train or not hold:
@@ -333,8 +442,20 @@ def _cv_rows(
         train_repos = sorted({ex.repo for ex in train})
         leak = sorted(set(hold_repos) & set(train_repos))
         metrics = _score_hold(
-            train, hold, config=config, seed=seed, scripted=scripted
+            train,
+            hold,
+            config=config,
+            seed=seed,
+            fold=fold,
+            scripted=scripted,
         )
+        direction: str | None
+        if assignment.strategy == "specialist":
+            direction = "specialist"
+        elif hold_repo:
+            direction = _leave_direction(hold_repos, hold_repo)
+        else:
+            direction = None
         rows.append(
             {
                 "seed": seed,
@@ -342,11 +463,11 @@ def _cv_rows(
                 "arm": config.arm,
                 "k_eval": k,
                 "split": assignment.strategy,
-                "direction": (
-                    _leave_direction(hold_repos, hold_repo) if hold_repo else None
-                ),
-                "n_train": len(train),
+                "direction": direction,
+                "n_train": metrics.get("n_train", len(train)),
                 "n_hold": len(hold),
+                "n_val": metrics.get("n_val", 0),
+                "n_split_train": metrics.get("n_split_train", len(train)),
                 "hold_repos": hold_repos,
                 "repo_leak": leak,
                 **metrics,
@@ -375,6 +496,10 @@ def _write_readme(path: Path, payload: dict[str, Any]) -> Path:
         "",
         f"K=3 truncation rate at {payload.get('max_tokens')} tokens: {trunc:.3f}.",
         "",
+        "Artifacts: `checkpoints/` (LoRA adapter + score.pt) and "
+        "`holdout_scores.jsonl` (per-task P(Qwen resolves)). Both are required; "
+        "metrics-only is not a complete run.",
+        "",
     ]
     if split_primary == "leave_repo":
         directions = payload.get("directions") or {}
@@ -391,6 +516,19 @@ def _write_readme(path: Path, payload: dict[str, Any]) -> Path:
                 f"{_fmt_mean_std(item.get('auroc'))}"
             )
         lines.append("")
+    elif split_primary == "specialist":
+        primary = payload.get("primary") or {}
+        block = primary.get("lora") or primary.get("scripted") or {}
+        lines.extend(
+            [
+                "## Specialist holdout (single 80/20, do not headline)",
+                "",
+                f"- Repo `{payload.get('hold_repo')}`",
+                f"- Route-AUC {_fmt_mean_std(block.get('route_auc'))}",
+                f"- AUROC {_fmt_mean_std(block.get('auroc'))}",
+                "",
+            ]
+        )
     else:
         primary = payload.get("primary") or {}
         block = primary.get("lora") or primary.get("scripted") or {}
@@ -470,12 +608,29 @@ def run_traj_train(
     scripted_scores: dict[str, float] | None = None,
     examples: list[TrajExample] | None = None,
 ) -> TrajTrainResult:
+    artifacts_base = resolve_artifacts_uri(
+        backend=backend, allow_unsynced=config.allow_unsynced
+    )
     examples, match_payload, counts = load_traj_examples(config, examples=examples)
     if not examples:
         raise ValueError("No trajectory examples after label match")
+    specialist = config.split_strategy == _SPLIT_SPECIALIST
+    leave_repo = config.split_strategy == _SPLIT_LEAVE_REPO
+    if specialist:
+        examples = [ex for ex in examples if ex.repo == config.hold_repo]
+        if not examples:
+            raise ValueError(
+                f"no trajectory examples remain for specialist repo {config.hold_repo!r}"
+            )
+        counts = dict(counts)
+        counts["n_examples"] = len(examples)
     router_for_hist = eval_examples(examples, k=_eval_k(config))
     histogram = repo_histogram(router_for_hist)
-    second_repo = second_holdout_repo(router_for_hist, config.hold_repo)
+    second_repo = (
+        None
+        if specialist
+        else second_holdout_repo(router_for_hist, config.hold_repo)
+    )
     trunc = truncation_report(
         examples,
         k=config.k_eval,
@@ -504,7 +659,6 @@ def run_traj_train(
 
     config.output_dir.mkdir(parents=True, exist_ok=True)
 
-    leave_repo = config.split_strategy == _SPLIT_LEAVE_REPO
     if leave_repo and config.hold_repo == _DJANGO_REPO and len(examples) == 500:
         n_hold = sum(1 for ex in examples if ex.repo == _DJANGO_REPO)
         n_rest = len(examples) - n_hold
@@ -520,6 +674,36 @@ def run_traj_train(
             assignment = assign_leave_repo_out(
                 router_for_hist, config.hold_repo, seed=seed
             )
+            primary_rows.extend(
+                _cv_rows(
+                    examples,
+                    assignment,
+                    config=config,
+                    seed=seed,
+                    scripted=scripted,
+                    hold_repo=config.hold_repo,
+                )
+            )
+            continue
+        if specialist:
+            assignment = assign_specialist_split(
+                router_for_hist, config.hold_repo, seed=seed
+            )
+            n_hold = sum(1 for fold in assignment.fold_of.values() if fold == 0)
+            n_train = sum(1 for fold in assignment.fold_of.values() if fold == 1)
+            if (
+                config.hold_repo == _DJANGO_REPO
+                and len(examples) == _DJANGO_HOLD_N
+                and (
+                    n_train != _DJANGO_SPECIALIST_TRAIN_N
+                    or n_hold != _DJANGO_SPECIALIST_HOLD_N
+                )
+            ):
+                raise ValueError(
+                    f"specialist django split expected "
+                    f"n_train={_DJANGO_SPECIALIST_TRAIN_N} n_hold={_DJANGO_SPECIALIST_HOLD_N}, "
+                    f"got {n_train}/{n_hold}"
+                )
             primary_rows.extend(
                 _cv_rows(
                     examples,
@@ -558,6 +742,13 @@ def run_traj_train(
             if config.hold_repo == _DJANGO_REPO
             else f"trajectory v3 {config.arm} leave-repo"
         )
+    elif specialist:
+        directions = {}
+        primary_summary = {head_name: _summarize(primary_rows)}
+        mean_auc = (primary_summary[head_name].get("route_auc") or {}).get("mean")
+        split_primary = "specialist"
+        n_folds_out = 1
+        arm_label = f"trajectory v3 {config.arm} specialist"
     else:
         directions = {}
         primary_summary = {head_name: _summarize(primary_rows)}
@@ -597,7 +788,7 @@ def run_traj_train(
         "repo_histogram": histogram,
         "second_holdout_repo": second_repo,
         "split_primary": split_primary,
-        "hold_repo": config.hold_repo if leave_repo else None,
+        "hold_repo": config.hold_repo if leave_repo or specialist else None,
         "seeds": list(config.seeds),
         "n_folds": n_folds_out,
         "primary": primary_summary,
@@ -631,7 +822,7 @@ def run_traj_train(
             "n_folds": n_folds_out,
             "seeds": list(config.seeds),
             "split_strategy": split_primary,
-            "hold_repo": config.hold_repo if leave_repo else None,
+            "hold_repo": config.hold_repo if leave_repo or specialist else None,
             "truncation_rate": truncation_rate,
             "k3_truncation_rate": truncation_rate,
             "mean_route_auc": mean_auc,
@@ -644,9 +835,28 @@ def run_traj_train(
             "label_match": match_payload,
             "gpu": gpu,
             "paper_deviation": PAPER_DEVIATION,
+            "checkpoints": [
+                row["checkpoint"]
+                for row in primary_rows
+                if row.get("checkpoint")
+            ],
+            "scores_path": str(holdout_scores_path(config.output_dir)),
         },
     )
     readme_path = _write_readme(config.output_dir / "README.md", results)
+    artifacts_uri = None
+    if artifacts_base:
+        planned = run_dest_uri(artifacts_base, config.run_id)
+        results["artifacts_uri"] = planned
+        results_path.write_text(
+            json.dumps(results, indent=2, sort_keys=True, ensure_ascii=False) + "\n",
+            encoding="utf-8",
+        )
+        artifacts_uri = finalize_run_artifacts(
+            config.output_dir,
+            base_uri=artifacts_base,
+            run_id=config.run_id,
+        )
     return TrajTrainResult(
         run_id=config.run_id,
         output_dir=config.output_dir,
@@ -657,4 +867,5 @@ def run_traj_train(
         split_strategy=split_primary,
         truncation_rate=truncation_rate,
         arm=config.arm,
+        artifacts_uri=artifacts_uri,
     )

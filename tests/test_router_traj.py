@@ -3,28 +3,45 @@
 from __future__ import annotations
 
 import json
+import math
 from pathlib import Path
 
 import pytest
 import yaml
 
 from hecate.data.external_miniswe import JoinedLabel
-from hecate.router.dataset import WhitespaceTokenizer
+from hecate.router.dataset import RouterExample, WhitespaceTokenizer
 from hecate.router.splits import LEAVE_REPO
 from hecate.router.traj import (
+    EARLY_STOP_METRIC,
+    EARLY_STOP_MIN_DELTA,
+    EARLY_STOP_PATIENCE,
+    FIT_VAL_N,
+    GRAD_CLIP_NORM,
     TrajError,
     TrajExample,
+    binary_brier,
+    binary_log_loss,
     build_traj_examples,
+    carve_fit_val,
     eval_examples,
     format_prefix,
     match_traj_labels,
     packed_prefixes,
     parse_trajectory,
     second_holdout_repo,
+    shuffle_train_rows,
     train_rows_for_arm,
     truncation_report,
 )
-from hecate.router.traj_runner import load_traj_train_config, run_traj_train
+from hecate.router.traj_runner import (
+    holdout_scores_path,
+    load_traj_train_config,
+    lora_checkpoint_dir,
+    require_lora_checkpoint,
+    run_traj_train,
+    write_holdout_scores,
+)
 
 
 def _label(instance_id: str, *, small: bool, large: bool = True, repo: str | None = None) -> JoinedLabel:
@@ -204,11 +221,14 @@ def test_build_examples_and_k0_vs_packed_k3_rows() -> None:
     assert report.n_matched == 1
     assert counts["n_examples"] == 1
     k0 = train_rows_for_arm(examples, arm="k0")
+    k1 = train_rows_for_arm(examples, arm="k1")
     k3 = train_rows_for_arm(examples, arm="k3")
     assert len(k0) == 1
     assert k0[0][0] == "issue"
+    assert len(k1) == 2
     assert len(k3) == 4
     assert eval_examples(examples, k=0)[0].text == "issue"
+    assert "Turn 1" in eval_examples(examples, k=1)[0].text
     assert "Turn 3" in eval_examples(examples, k=3)[0].text
 
 
@@ -287,10 +307,22 @@ def test_run_traj_train_leave_repo_scripted(tmp_path: Path) -> None:
     assert manifest["paper_deviation"].startswith("No 3-way")
     assert "K=0 is a separately trained" in result.readme_path.read_text(encoding="utf-8")
     assert result.split_strategy == "leave_repo"
+    scores_file = holdout_scores_path(tmp_path / "ldo")
+    assert scores_file.is_file()
+    score_rows = [
+        json.loads(line)
+        for line in scores_file.read_text(encoding="utf-8").splitlines()
+        if line
+    ]
+    assert {row["instance_id"] for row in score_rows} == set(scores)
+    assert manifest["scores_path"] == str(scores_file)
+    assert manifest["checkpoints"] == []
     for row in payload["primary_folds"]["scripted"]:
         if row["direction"] == "hold_django":
             assert row["hold_repos"] == ["django/django"]
             assert row["split"] == LEAVE_REPO
+            assert row["checkpoint"] is None
+            assert row["scores_path"] == str(scores_file)
 
 
 def test_run_traj_train_k0_grouped_scripted(tmp_path: Path) -> None:
@@ -324,6 +356,42 @@ def test_run_traj_train_k0_grouped_scripted(tmp_path: Path) -> None:
     assert payload["arm_key"] == "k0"
     assert "scripted" in payload["primary"]
     assert (tmp_path / "grp" / "truncation.json").is_file()
+    assert holdout_scores_path(tmp_path / "grp").is_file()
+
+
+def test_lora_checkpoint_is_required_on_disk(tmp_path: Path) -> None:
+    ckpt = lora_checkpoint_dir(tmp_path, arm="k3", seed=0, fold=0)
+    with pytest.raises(RuntimeError, match="missing LoRA score head"):
+        require_lora_checkpoint(ckpt)
+    ckpt.mkdir(parents=True)
+    (ckpt / "score.pt").write_bytes(b"x")
+    (ckpt / "adapter").mkdir()
+    with pytest.raises(RuntimeError, match="missing LoRA adapter"):
+        require_lora_checkpoint(ckpt)
+    (ckpt / "adapter" / "adapter_config.json").write_text("{}\n", encoding="utf-8")
+    assert require_lora_checkpoint(ckpt) == ckpt
+    examples = [
+        RouterExample(
+            instance_id="django/django-1",
+            repo="django/django",
+            text="q",
+            truncated=False,
+            m1_resolves=True,
+            m2_resolves=True,
+        )
+    ]
+    path = write_holdout_scores(
+        holdout_scores_path(tmp_path),
+        examples=examples,
+        scores=[0.42],
+        seed=0,
+        fold=0,
+        arm="k3",
+        k_eval=3,
+    )
+    row = json.loads(path.read_text(encoding="utf-8").splitlines()[0])
+    assert row["instance_id"] == "django/django-1"
+    assert row["score"] == pytest.approx(0.42)
 
 
 def test_parse_traj_dir_jsonl_and_duplicate_ids(tmp_path: Path) -> None:
@@ -344,3 +412,249 @@ def test_parse_traj_dir_jsonl_and_duplicate_ids(tmp_path: Path) -> None:
     (stub / "full.jsonl").write_text(unique.read_text(encoding="utf-8"), encoding="utf-8")
     (stub / "provenance.json").write_text('{"provenance": "hf"}\n', encoding="utf-8")
     assert set(parse_traj_dir(stub)) == {"django__django-1"}
+
+
+def test_eval_k_is_1_for_k1_arm(tmp_path: Path) -> None:
+    from hecate.router.traj_runner import _eval_k
+
+    yaml_path = tmp_path / "router_traj.yaml"
+    yaml_path.write_text("backbone: x\n", encoding="utf-8")
+    config = load_traj_train_config(
+        config_path=yaml_path,
+        csv_path=tmp_path / "unused.csv",
+        traj_dir=tmp_path / "trajs",
+        output_dir=tmp_path / "k1",
+        arm="k1",
+    )
+    assert _eval_k(config) == 1
+
+
+def test_run_traj_train_specialist_one_fold(tmp_path: Path) -> None:
+    examples: list[TrajExample] = []
+    scores: dict[str, float] = {}
+    for i in range(8):
+        iid = f"django/django-{i}"
+        examples.append(
+            _example(
+                iid,
+                repo="django/django",
+                m1=bool(i < 5),
+                prefixes=(f"q {iid}", f"t {iid}"),
+            )
+        )
+        scores[iid] = 0.9 if i < 5 else 0.1
+    for i in range(4):
+        iid = f"sympy/sympy-{i}"
+        examples.append(
+            _example(
+                iid,
+                repo="sympy/sympy",
+                m1=False,
+                prefixes=(f"q {iid}", f"t {iid}"),
+            )
+        )
+        scores[iid] = 0.1
+    yaml_path = tmp_path / "router_traj.yaml"
+    yaml_path.write_text(
+        yaml.safe_dump({"backbone": "x", "seeds": [0]}),
+        encoding="utf-8",
+    )
+    config = load_traj_train_config(
+        config_path=yaml_path,
+        csv_path=tmp_path / "unused.csv",
+        traj_dir=tmp_path / "trajs",
+        output_dir=tmp_path / "spec-traj",
+        run_id="spec-traj",
+        split="specialist",
+        hold_repo="django/django",
+        arm="k1",
+        seeds=(0,),
+    )
+    result = run_traj_train(
+        config, backend="scripted", scripted_scores=scores, examples=examples
+    )
+    payload = json.loads(result.results_path.read_text(encoding="utf-8"))
+    assert payload["split_primary"] == "specialist"
+    assert payload["n_folds"] == 1
+    assert payload["k_eval"] == 1
+    assert payload["hold_repo"] == "django/django"
+    assert payload["n_examples"] == 8
+    assert payload["second_holdout_repo"] is None
+    folds = payload["primary_folds"]["scripted"]
+    assert len(folds) == 1
+    assert folds[0]["fold"] == 0
+    assert folds[0]["n_train"] + folds[0]["n_hold"] == 8
+    scores_file = holdout_scores_path(tmp_path / "spec-traj")
+    assert scores_file.is_file()
+    assert "informative_subset" in folds[0]
+
+
+def test_specialist_holdout_ids_match_across_text_and_traj_runners(tmp_path: Path) -> None:
+    from hecate.router.dataset import RouterExample
+    from hecate.router.text_runner import load_text_train_config, run_text_train
+
+    n_pos, n_neg = 10, 8
+    text_examples: list[RouterExample] = []
+    traj_examples: list[TrajExample] = []
+    scores: dict[str, float] = {}
+    for i in range(n_pos):
+        iid = f"django/django-pos-{i:02d}"
+        text_examples.append(
+            RouterExample(
+                instance_id=iid,
+                repo="django/django",
+                text=f"text {iid}",
+                truncated=False,
+                m1_resolves=True,
+                m2_resolves=True,
+            )
+        )
+        traj_examples.append(
+            _example(iid, repo="django/django", m1=True, prefixes=(f"q {iid}",))
+        )
+        scores[iid] = 0.9
+    for i in range(n_neg):
+        iid = f"django/django-neg-{i:02d}"
+        text_examples.append(
+            RouterExample(
+                instance_id=iid,
+                repo="django/django",
+                text=f"text {iid}",
+                truncated=False,
+                m1_resolves=False,
+                m2_resolves=True,
+            )
+        )
+        traj_examples.append(
+            _example(iid, repo="django/django", m1=False, prefixes=(f"q {iid}",))
+        )
+        scores[iid] = 0.1
+
+    text_config = load_text_train_config(
+        csv_path=tmp_path / "unused.csv",
+        output_dir=tmp_path / "cross-text",
+        run_id="cross-text",
+        split="specialist",
+        hold_repo="django/django",
+        seeds=(0,),
+    )
+    run_text_train(
+        text_config,
+        backend="scripted",
+        scripted_scores=scores,
+        examples=list(reversed(text_examples)),
+    )
+    yaml_path = tmp_path / "router_traj.yaml"
+    yaml_path.write_text("backbone: x\n", encoding="utf-8")
+    traj_config = load_traj_train_config(
+        config_path=yaml_path,
+        csv_path=tmp_path / "unused.csv",
+        traj_dir=tmp_path / "trajs",
+        output_dir=tmp_path / "cross-traj",
+        run_id="cross-traj",
+        split="specialist",
+        hold_repo="django/django",
+        arm="k0",
+        seeds=(0,),
+    )
+    run_traj_train(
+        traj_config,
+        backend="scripted",
+        scripted_scores=scores,
+        examples=traj_examples,
+    )
+
+    def _ids(path: Path) -> set[str]:
+        return {
+            json.loads(line)["instance_id"]
+            for line in path.read_text(encoding="utf-8").splitlines()
+            if line
+        }
+
+    text_ids = _ids(tmp_path / "cross-text" / "holdout_scores.jsonl")
+    traj_ids = _ids(tmp_path / "cross-traj" / "holdout_scores.jsonl")
+    assert text_ids == traj_ids
+    assert text_ids
+
+
+def test_carve_fit_val_is_seeded_stratified_and_skips_tiny_pools() -> None:
+    pool = [
+        _example(
+            f"django/django-{i}",
+            repo="django/django",
+            m1=bool(i < 108),
+            prefixes=(f"q {i}", f"t {i}"),
+        )
+        for i in range(185)
+    ]
+    fit, val = carve_fit_val(pool, n_val=20, seed=0)
+    assert len(val) == 20
+    assert len(fit) == 165
+    assert {ex.instance_id for ex in fit}.isdisjoint({ex.instance_id for ex in val})
+    assert sum(ex.m1_resolves for ex in val) == 12
+    assert sum(not ex.m1_resolves for ex in val) == 8
+    again, _ = carve_fit_val(pool, n_val=20, seed=0)
+    assert [ex.instance_id for ex in again] == [ex.instance_id for ex in fit]
+    other, other_val = carve_fit_val(pool, n_val=20, seed=1)
+    assert [ex.instance_id for ex in other_val] != [ex.instance_id for ex in val]
+    tiny = pool[:10]
+    all_fit, empty = carve_fit_val(tiny, n_val=20, seed=0)
+    assert empty == []
+    assert len(all_fit) == 10
+
+
+def test_shuffle_train_rows_changes_order_across_epochs() -> None:
+    rows = [(f"t{i}", bool(i % 2), f"id-{i}") for i in range(12)]
+    e0 = shuffle_train_rows(rows, seed=0, epoch=0)
+    e1 = shuffle_train_rows(rows, seed=0, epoch=1)
+    assert e0 != rows or e1 != rows
+    assert e0 != e1
+    assert shuffle_train_rows(rows, seed=0, epoch=0) == e0
+    assert sorted(e0) == sorted(rows)
+
+
+def test_binary_log_loss_and_brier() -> None:
+    labels = [True, False]
+    assert binary_brier([1.0, 0.0], labels) == 0.0
+    assert abs(binary_brier([0.99945, 0.99945], labels) - 0.5) < 0.01
+    ce = binary_log_loss([0.5, 0.5], labels)
+    assert abs(ce - math.log(2)) < 1e-9
+
+
+def test_early_stop_rule_is_precommitted(tmp_path: Path) -> None:
+    yaml_path = tmp_path / "router_traj.yaml"
+    yaml_path.write_text("backbone: x\n", encoding="utf-8")
+    config = load_traj_train_config(
+        config_path=yaml_path,
+        csv_path=tmp_path / "unused.csv",
+        traj_dir=tmp_path / "trajs",
+        output_dir=tmp_path / "es",
+        arm="k0",
+    )
+    assert FIT_VAL_N == 20
+    assert GRAD_CLIP_NORM == 1.0
+    assert EARLY_STOP_METRIC == "val_ce"
+    assert EARLY_STOP_PATIENCE == 2
+    assert EARLY_STOP_MIN_DELTA == 0.01
+    assert config.val_size == 20
+    assert config.grad_clip_norm == 1.0
+    assert config.early_stopping is False
+    assert config.early_stopping_metric == "val_ce"
+    assert config.early_stopping_patience == 2
+    assert config.early_stopping_min_delta == 0.01
+
+
+def test_committed_traj_yaml_enables_early_stopping(tmp_path: Path) -> None:
+    repo = Path(__file__).resolve().parents[1]
+    config = load_traj_train_config(
+        config_path=repo / "configs" / "router_traj.yaml",
+        csv_path=tmp_path / "unused.csv",
+        traj_dir=tmp_path / "trajs",
+        output_dir=tmp_path / "es_on",
+        arm="k0",
+    )
+    assert config.early_stopping is True
+    assert config.early_stopping_metric == "val_ce"
+    assert config.early_stopping_patience == 2
+    assert config.early_stopping_min_delta == 0.01
+

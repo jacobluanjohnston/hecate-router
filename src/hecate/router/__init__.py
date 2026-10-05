@@ -27,6 +27,7 @@ from hecate.router.splits import (
     assign_grouped_repo_folds,
     assign_label_stratified_folds,
     assign_leave_repo_out,
+    assign_specialist_split,
 )
 from hecate.router.text_runner import (
     TextTrainConfig,
@@ -35,9 +36,12 @@ from hecate.router.text_runner import (
     run_text_train,
 )
 from hecate.router.traj import (
+    TRAJ_ARMS,
+    ArmSpec,
     TrajExample,
     TrajError,
     build_traj_examples,
+    parse_arm,
     parse_trajectory,
     second_holdout_repo,
 )
@@ -56,6 +60,8 @@ __all__ = [
     "ScriptedBackend",
     "TextTrainConfig",
     "TextTrainResult",
+    "TRAJ_ARMS",
+    "ArmSpec",
     "TrajError",
     "TrajExample",
     "TrajTrainConfig",
@@ -71,6 +77,7 @@ __all__ = [
     "assign_grouped_repo_folds",
     "assign_label_stratified_folds",
     "assign_leave_repo_out",
+    "assign_specialist_split",
     "build_examples",
     "build_examples_from_text",
     "load_text_train_config",
@@ -81,6 +88,7 @@ __all__ = [
     "run_traj_train",
     "run_train",
     "text_route_metrics",
+    "parse_arm",
     "parse_trajectory",
     "build_traj_examples",
     "second_holdout_repo",
