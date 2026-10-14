@@ -230,8 +230,8 @@ Each task is scored out of 10. Your sprint score is the average of your two task
 | Specs | Observable behavior and edge cases; names every interface the tests use | Behavior stated, gaps remain | Describes implementation, or missing | 2 |
 | Acceptance criteria | Every item pass/fail and checkable | Some items vague | Missing or not checkable | 2 |
 | Tests section | Every criterion mapped to a test with setup and assertion | Some criteria unmapped | Names only, or missing | 1 |
-| Test quality | Tests assert the criteria and fail without the implementation | Some weak or trivial assertions | Tests cannot fail | 1 |
-| Tests pass | All task tests pass at `-done`; existing tests still pass | Some task tests still failing | Tests do not run, or missing | 2 |
+| Test quality | Tests assert the criteria and fail without the implementation | Some weak or trivial assertions | Tests pass even without the implementation | 1 |
+| Tests pass | All task tests pass at `-done`; existing tests still pass | Some task tests still failing | Tests do not run, all fail, or are missing | 2 |
 | Process | Spec committed first, both tags pushed, Scrum board card present, both tasks submitted in the app | One step missing or late | Implementation committed before the task file | 1 |
 
 Consent to the research, whether a task is later chosen for the benchmark, which AI tools you used, and how any AI tool performs on your task do not affect your grade.
