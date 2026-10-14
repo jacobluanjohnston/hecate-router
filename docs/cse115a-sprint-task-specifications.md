@@ -9,7 +9,7 @@ Every sprint, you write two of your own tasks in full, with six fields, before y
 
 You already break user stories into tasks in the sprint plan.
 
-You practice splitting a story into a slice one person can finish in 2–3 days, writing pass/fail acceptance criteria, writing a test for each criterion, and leaving a git history that shows where the work started and ended.
+You practice splitting a story into a slice one person can finish in 2–3 days (including review), writing pass/fail acceptance criteria, writing a test for each criterion, and leaving a git history that shows where the work started and ended.
 
 AI coding tools are allowed under the course AI policy. You are responsible for everything you commit. You must be able to explain your code.
 
@@ -20,7 +20,7 @@ You own at least two tasks each sprint. Each task must meet all of these:
 - You are the only assignee. You write the task file (you will discuss and clarify it with your team members), the tests, and the implementation. Teammates may review. They do not commit to your task branch.
 - Your two tasks are different slices. A revision, rename, or follow-up fix of the first is not a second task.
 - Estimated at 2 hours or more, and it changes behavior a user or another part of the system can observe.
-- One person can finish it in 2–3 days.
+- Small enough that one person can finish within 2–3 days, including review.
 - The task file is created before any implementation code.
 - Every acceptance criterion has at least one committed test.
 
@@ -123,7 +123,7 @@ git push origin task/US-1-T-1 US-1-T-1-base
 **6. Open a pull request**
 - Open it from your own GitHub account.
 - Title: `US-1-T-1: <title>`.
-- The PR changes only this task's file under `docs/tasks/`. One task file per PR.
+- Within `docs/tasks/`, this PR changes exactly one file: your task file, `docs/tasks/sprint-N/<task id>.md`. (Changes outside `docs/tasks/` are fine.)
 - A teammate reviews it.
 - Before merging, check that your task spec is the first commit on the branch:
   ```bash
