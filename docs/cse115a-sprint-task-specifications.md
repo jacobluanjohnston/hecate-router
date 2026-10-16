@@ -90,9 +90,6 @@ Setup for all: start the app with an empty user store and send requests to `/api
 
 Steps below use `US-1-T-1` (User Story 1, Task 1) as the example task id, swap in your own.
 
-**Team setup (once, before your first task)**
-- One teammate with admin access to the team repository turns off the merge options that break the Process check: **Settings → General → Pull Requests**. Keep **Allow merge commits** checked, and uncheck **Allow squash merging** and **Allow rebase merging**. Then the merge button can only make a merge commit.
-
 **1. Create the task**
 - Write the task file at `docs/tasks/sprint-1/US-1-T-1.md` (use your sprint number, not the letter `N`).
 - Add a card for it to your Scrum board (e.g. GitHub Projects).
@@ -131,7 +128,7 @@ git push origin task/US-1-T-1 US-1-T-1-base
   git log --oneline --reverse origin/main..
   ```
   The first line should be your task spec commit. If it isn't, see [Fixing mistakes](#fixing-mistakes) before you merge.
-- Merge once the team's test command passes, using **Merge pull request** (a merge commit). Do not use **Squash and merge** or **Rebase and merge**. Both rewrite your commits, so the spec commit and its `-base` tag no longer appear on `main`, and the Process check fails. GitHub remembers your last choice, so check the button label before clicking. If your team did the [team setup](#workflow), this is the only option.
+- Merge once the task's tests and the existing tests pass.
 
 **7. Tag the merge commit**
 
@@ -179,7 +176,16 @@ Before pressing **Submit Sprint N**, check **each of the following for both task
 
 ## Fixing mistakes
 
-These steps cover two mistakes: your task spec isn't the first commit on the branch, or you amended, rebased, or force-pushed it after tagging.
+Which fix you need depends on the first commit on the branch: the top entry on the pull request's **Commits** tab.
+
+**If the first commit is your task file alone, but the `-base` tag is missing or on another commit** (for example, you amended, rebased, or force-pushed the spec commit after tagging): move the tag to the first commit. This works before or after the merge, and the task card in the app shows the exact command.
+```bash
+git tag -f US-1-T-1-base <first commit sha>
+git push -f origin US-1-T-1-base
+```
+Then press **Re-check** in the app.
+
+**If the first commit isn't your task file alone** (code came first, or the spec commit also contains code), it can't be fixed on that branch. What to do next depends on whether the PR is merged.
 
 **If your PR is not yet merged:** don't edit or delete files on that branch. Commits added later don't change which commit is first. Instead:
 
@@ -204,7 +210,7 @@ These steps cover two mistakes: your task spec isn't the first commit on the bra
 
 **If your PR is already merged:** submit the task anyway. You lose the Process point (1 of 10), but everything else is graded normally. Do not delete and re-add files to rewrite the history.
 
-If the PR was squash- or rebase-merged, ask your team to do the [team setup](#workflow) so it can't happen again.
+If the PR was squash- or rebase-merged and the branch is gone from your computer, the tag commands above need `git fetch origin pull/<PR number>/head` first, or git can't find the commit.
 
 If you're unsure, ask a TA before changing anything.
 
